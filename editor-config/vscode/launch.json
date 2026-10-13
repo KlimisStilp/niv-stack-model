@@ -1,0 +1,40 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "niv: fetch (dry run, 365 d)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "niv.cli",
+      "args": ["fetch", "--source", "elexon", "--days", "365", "--dry-run"],
+      "console": "integratedTerminal",
+      "env": { "PYTHONPATH": "${workspaceFolder}/src" }
+    },
+    {
+      "name": "niv: fetch elexon (core, 365 d)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "niv.cli",
+      "args": ["fetch", "--source", "elexon", "--days", "365"],
+      "console": "integratedTerminal",
+      "env": { "PYTHONPATH": "${workspaceFolder}/src" }
+    },
+    {
+      "name": "niv: verify endpoints",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "niv.cli",
+      "args": ["verify"],
+      "console": "integratedTerminal",
+      "env": { "PYTHONPATH": "${workspaceFolder}/src" }
+    },
+    {
+      "name": "pytest: current file",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["${file}"],
+      "console": "integratedTerminal"
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    { "label": "test", "type": "shell", "command": "${workspaceFolder}/.venv/bin/python -m pytest", "group": "test" },
+    { "label": "lint", "type": "shell", "command": "${workspaceFolder}/.venv/bin/ruff check src tests" },
+    { "label": "verify endpoints", "type": "shell", "command": "${workspaceFolder}/.venv/bin/niv verify" },
+    { "label": "fetch 1y core data", "type": "shell", "command": "${workspaceFolder}/.venv/bin/niv fetch --source elexon --days 365" }
+  ]
+}
