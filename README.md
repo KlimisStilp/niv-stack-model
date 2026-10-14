@@ -48,7 +48,7 @@ Output: raw chunks in `data/raw/<source>/<dataset>/`, consolidated tables in
 ```bash
 niv build-dataset        # leak-free (target period, lead) table -> data/features/niv_dataset.parquet
 niv backtest --quick     # ~3 min smoke run of the whole pipeline
-niv backtest             # full backtest -> data/backtest/{predictions.parquet,*.csv,report.md,figures/*.pdf}
+niv backtest --test-start 2026-01   # full backtest (test period Jan 2026 -> end of data) -> data/backtest/{predictions.parquet,*.csv,report.md,figures/*.pdf}
 niv figures              # regenerate the publication PDFs from stored forecasts (no refit)
 ```
 

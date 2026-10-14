@@ -230,3 +230,9 @@ def test_figures_pipeline_writes_pdfs(tmp_path):
     w.to_csv(tmp_path / "weights.csv")
     pdfs = make_figures(tmp_path / "predictions.parquet", tmp_path / "weights.csv", tmp_path / "f")
     assert len(pdfs) == 9 and all(p.stat().st_size > 1000 for p in pdfs)
+
+
+def test_weather_leak_rule():
+    from niv.dataset import wx_day_for_lead
+
+    assert [wx_day_for_lead(h) for h in (2, 16, 17, 40)] == [1, 1, 2, 2]

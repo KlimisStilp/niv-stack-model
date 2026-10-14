@@ -2,16 +2,17 @@
 
 Protocol
 --------
-1. Calendar months ``m_0 < m_1 < ...``. For each test month ``m_k`` (``k >= first_test``) every base
-   learner is fitted on rows whose *target* period ends before ``start(m_k) - embargo`` and predicts
-   month ``m_k``. The predictions are stored as out-of-fold (OOF) base forecasts.
+1. Calendar months ``m_0 < m_1 < ...``. For each month ``m_k`` from ``test_start - oof_months``
+   on, every base learner is fitted on rows whose *target* period ends before
+   ``start(m_k) - embargo`` and predicts month ``m_k``. The predictions are stored as out-of-fold
+   (OOF) base forecasts; months before ``test_start`` are the validation period for the stack.
 2. The meta-learner (:class:`niv.stack.GatedQuantileStack`) for month ``m_k`` is fitted only on OOF
    predictions of earlier months (again with an embargo), so no information from the future is used
    in weights, gate or scale head (Bergmeir & Benitez, 2012; Cerqueira et al., 2020).
 3. Stacked quantiles are recalibrated online per lead time by delayed-feedback ACI/CQR
    (:mod:`niv.conformal`).
-4. Everything is scored on the months for which a stack exists, so all candidates are compared on
-   identical rows.
+4. Everything is scored on the test months (``test_start`` to the end of the data), so all
+   candidates are compared on identical rows.
 
 References
 ----------
@@ -60,11 +61,21 @@ def _month_index(t: pd.Series) -> pd.Series:
 def run_backtest(
     root: str | Path,
     quick: bool = False,
-    first_test: int = 3,
-    stack_start: int = 5,
+    test_start: str = "2026-01",
+    oof_months: int = 6,
+    min_train_days: int = 60,
     max_months: int | None = None,
+    exclude_prefixes: tuple[str, ...] = (),
 ) -> BacktestResult:
     """Run the sequential backtest and return aligned predictions.
+
+    Three roles of time (all expanding, with a 48 h embargo before every refit):
+
+    * **base training** - everything before the month being predicted;
+    * **out-of-fold (validation) months** - the ``oof_months`` calendar months before
+      ``test_start`` plus all test months so far; base learners predict them and the
+      meta-learner is fitted on these predictions only;
+    * **test months** - ``test_start`` until the end of the data; scored.
 
     Parameters
     ----------
@@ -72,25 +83,45 @@ def run_backtest(
         Data root containing ``features/niv_dataset.parquet``.
     quick:
         Use smaller/faster base learners.
-    first_test:
-        Index of the first month used as an out-of-fold test month for base learners.
-    stack_start:
-        Index of the first month for which a stacked forecast is produced.
+    test_start:
+        First test month as ``YYYY-MM`` (inclusive); the test period runs to the end of the data.
+    oof_months:
+        Number of months before ``test_start`` used to generate out-of-fold predictions that
+        train the stack for the first test months.
+    min_train_days:
+        A month is skipped as an out-of-fold month if fewer days of training data precede it.
     max_months:
-        Optionally stop after this many months (for debugging).
+        Optionally stop after this many months from the first out-of-fold month (debugging).
+    exclude_prefixes:
+        Drop every feature whose name starts with one of these prefixes (ablation studies).
 
     """
     df = load_dataset(root).dropna(subset=["y"]).sort_values(["startTime", "lead_h"])
     df = df.reset_index(drop=True)
+    drop = [c for c in df.columns if c.startswith(exclude_prefixes)] if exclude_prefixes else []
+    df = df.drop(columns=drop)
     feats = feature_columns(df)
     mon = _month_index(df["startTime"])
     months = sorted(mon.unique())
+    if test_start not in months:
+        raise ValueError(f"test_start {test_start} not in data months {months[0]}..{months[-1]}")
+    ts = months.index(test_start)
+    data_start = df["startTime"].min()
+    first = max(ts - oof_months, 0)
+    folds = []
+    for k in range(first, len(months)):
+        t0 = df.loc[mon.values == months[k], "startTime"].min()
+        if (t0 - EMBARGO - data_start).days < min_train_days:
+            log.info("skip %s: less than %d training days", months[k], min_train_days)
+            continue
+        folds.append(k)
     if max_months:
-        months = months[: first_test + max_months]
-    names: list[str] = []
+        folds = folds[:max_months]
+    if not folds or folds[0] > ts:
+        raise ValueError("no out-of-fold month available before the test period")
     oof: dict[str, list[np.ndarray]] = {}
     oof_idx: list[np.ndarray] = []
-    for k in range(first_test, len(months)):
+    for k in folds:
         te_idx = np.where(mon.values == months[k])[0]
         t0 = df.loc[te_idx, "startTime"].min()
         tr_idx = np.where(df["startTime"].values < (t0 - EMBARGO).to_datetime64())[0]
@@ -113,10 +144,15 @@ def run_backtest(
     stat_q = np.full((len(idx), len(LEVELS)), np.nan)
     gate_q = stat_q.copy()
     wrows = []
-    for k in range(stack_start, len(months)):
+    for k in range(ts, len(months)):
         te = fold_of == months[k]
+        if not te.any():
+            continue
         t0 = pd.Timestamp(tgt[te].min())
         tr = tgt < (t0 - EMBARGO).to_datetime64()
+        if tr.sum() < 5000:
+            log.info("no stack for %s: only %d out-of-fold rows", months[k], tr.sum())
+            continue
         Qtr = [P[n][tr] for n in names]
         Qte = [P[n][te] for n in names]
         st_static = GatedQuantileStack(LEVELS, gate=False, scale_head=False).fit(Qtr, y[tr])

@@ -62,7 +62,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     b = sub.add_parser("backtest", help="expanding-window backtest of base learners and the stack")
     b.add_argument("--quick", action="store_true", help="smaller/faster base learners")
-    b.add_argument("--max-months", type=int, help="limit the number of test months (debug)")
+    b.add_argument("--test-start", default="2026-01", help="first test month YYYY-MM (2026-01)")
+    b.add_argument("--oof-months", type=int, default=6, help="out-of-fold months before test")
+    b.add_argument("--exclude-prefix", action="append", default=[], help="drop features by prefix")
+    b.add_argument("--max-months", type=int, help="limit the number of folds (debug)")
     b.add_argument("--out", help="output directory (default <data>/backtest)")
 
     f = sub.add_parser("fetch", help="download data")
@@ -78,6 +81,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["historical_forecast", "previous_runs"],
         default="historical_forecast",
     )
+    f.add_argument("--weather-models", help="comma-separated Open-Meteo models")
+    f.add_argument("--weather-vars", help="comma-separated hourly variables")
+    f.add_argument("--weather-days", default="1,2", help="previous-day offsets (default 1,2)")
     f.add_argument("--zones", help="ENTSO-E zones, comma-separated")
     f.add_argument("--resource", help="NESO CKAN resource id")
     f.add_argument("--name", help="NESO dataset name for storage")
@@ -149,6 +155,9 @@ def cmd_fetch(args: argparse.Namespace) -> int:
             start.date(),
             end.date() - timedelta(days=1),
             mode=args.weather_mode,
+            models=args.weather_models.split(",") if args.weather_models else None,
+            hourly=args.weather_vars.split(",") if args.weather_vars else None,
+            previous_days=tuple(int(k) for k in args.weather_days.split(",")),
             force=args.force,
             dry_run=args.dry_run,
         )
@@ -179,7 +188,14 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     from niv.reports import make_figures
 
     out = Path(args.out) if args.out else data_dir() / "backtest"
-    res = run_backtest(data_dir(), quick=args.quick, max_months=args.max_months)
+    res = run_backtest(
+        data_dir(),
+        quick=args.quick,
+        test_start=args.test_start,
+        oof_months=args.oof_months,
+        max_months=args.max_months,
+        exclude_prefixes=tuple(args.exclude_prefix),
+    )
     tables = evaluate(res)
     save(res, tables, out)
     make_figures(out / "predictions.parquet", out / "weights.csv", out / "figures")

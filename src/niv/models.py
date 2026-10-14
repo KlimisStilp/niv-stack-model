@@ -49,6 +49,10 @@ LEAD_BLOCKS = (0, 6, 16, 28, 41)  # [0,6), [6,16), [16,28), [28,41)
 
 #: Columns used by the GAMLSS location (mu) equation.
 GAMLSS_MU_COLS = [
+    "wx_wpow",
+    "wx_wspd",
+    "wx_ghi",
+    "wx_temp",
     "ind_imb",
     "ind_imb_x_lead",
     "ind_missing",
@@ -66,6 +70,9 @@ GAMLSS_MU_COLS = [
     "niv_seas336",
     "ssp_last",
     "mid_last",
+    "dis_vol_last",
+    "dis_vol_m48",
+    "dis_sovol_m48",
     "fuel_wind",
     "fuel_ccgt",
     "fuel_ic_net",
@@ -80,6 +87,8 @@ GAMLSS_MU_COLS = [
 ]
 #: Columns used by the GAMLSS scale (sigma) equation (volatility / uncertainty drivers).
 GAMLSS_SIGMA_COLS = [
+    "wx_wspd_modsd",
+    "wx_wspd_ptsd",
     "lead_h",
     "niv_s48",
     "niv_s336",
@@ -92,6 +101,7 @@ GAMLSS_SIGMA_COLS = [
     "pod_sin",
     "pod_cos",
     "ssp_s48",
+    "dis_vol_s48",
     "is_wkend",
 ]
 
@@ -266,11 +276,15 @@ class OndilGAMLSS(QuantileModel):
         from ondil import distributions as D
         from ondil.estimators import OnlineDistributionalRegression
 
+        avail = set(X.columns)
+        mu_cols = [c for c in GAMLSS_MU_COLS if c in avail]
+        sg_cols = [c for c in GAMLSS_SIGMA_COLS if c in avail]
+        self._cols = list(dict.fromkeys(mu_cols + sg_cols))
         step = max(1, len(X) // self.max_rows)
         A = self._prep(X.iloc[::step], fit=True)
         ys = np.asarray(y[::step], dtype=float)
-        mu_idx = np.array([self._cols.index(c) for c in GAMLSS_MU_COLS])
-        sg_idx = np.array([self._cols.index(c) for c in GAMLSS_SIGMA_COLS])
+        mu_idx = np.array([self._cols.index(c) for c in mu_cols])
+        sg_idx = np.array([self._cols.index(c) for c in sg_cols])
         last_err = None
         for dist_name in dict.fromkeys([self.distribution, "StudentT"]):
             dist = getattr(D, dist_name)()

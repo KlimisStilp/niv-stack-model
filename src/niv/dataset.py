@@ -39,6 +39,7 @@ References
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 import numpy as np
@@ -231,6 +232,167 @@ def _calendar(start: pd.Series) -> pd.DataFrame:
     )
 
 
+#: Minimum share of non-zero NETBSAD periods for its features to be added (it is near-empty).
+NETBSAD_MIN_NONZERO = 0.005
+
+
+def _bsad_series(root: Path, sp: pd.DataFrame) -> dict[str, pd.Series]:
+    """Build half-hourly realised series from DISBSAD (and NETBSAD when informative).
+
+    DISBSAD lists the non-BM balancing-service adjustments entering NIV, one row per action.
+    Per settlement period we aggregate: net volume (``dis_vol``), volume of System-Operator
+    flagged actions (``dis_sovol``), net cost (``dis_cost``) and the number of non-zero actions
+    (``dis_n``). Periods without any row are zero (nothing was adjusted), not missing.
+    NETBSAD is a per-period summary that is almost always zero; its price adjustment is added as
+    ``nbsad_buy_adj`` only if more than :data:`NETBSAD_MIN_NONZERO` of periods are non-zero.
+    Both are published after settlement, so they are used only through
+    :func:`lagged_features` with the NIV publication lag (an assumption: see module docstring).
+
+    Returns
+    -------
+    dict
+        ``name -> Series`` indexed by period ``startTime`` (UTC) over all periods in ``sp``.
+
+    """
+    keys = sp[["startTime", "settlementDate", "settlementPeriod"]].copy()
+    keys["settlementDate"] = keys["settlementDate"].astype(str)
+    out: dict[str, pd.Series] = {}
+    path = root / "processed/elexon/disbsad.parquet"
+    if path.exists():
+        d = pd.read_parquet(
+            path, columns=["settlementDate", "settlementPeriod", "cost", "volume", "soFlag"]
+        )
+        d["settlementDate"] = d["settlementDate"].astype(str)
+        d = d.drop_duplicates()
+        d = d[d["volume"].fillna(0) != 0]
+        d["sovol"] = np.where(d["soFlag"].astype(bool), d["volume"], 0.0)
+        g = (
+            d.groupby(["settlementDate", "settlementPeriod"])
+            .agg(
+                dis_vol=("volume", "sum"),
+                dis_sovol=("sovol", "sum"),
+                dis_cost=("cost", "sum"),
+                dis_n=("volume", "size"),
+            )
+            .reset_index()
+        )
+        m = keys.merge(g, on=["settlementDate", "settlementPeriod"], how="left").fillna(0.0)
+        for c in ("dis_vol", "dis_sovol", "dis_cost", "dis_n"):
+            out[c] = m.set_index("startTime")[c]
+    path = root / "processed/elexon/netbsad.parquet"
+    if path.exists():
+        n = pd.read_parquet(
+            path, columns=["settlementDate", "settlementPeriod", "buyPricePriceAdjustment"]
+        ).drop_duplicates()
+        n["settlementDate"] = n["settlementDate"].astype(str)
+        share = float((n["buyPricePriceAdjustment"].fillna(0) != 0).mean())
+        if share > NETBSAD_MIN_NONZERO:
+            m = keys.merge(n, on=["settlementDate", "settlementPeriod"], how="left").fillna(0.0)
+            out["nbsad_buy_adj"] = m.set_index("startTime")["buyPricePriceAdjustment"]
+        else:
+            log.info("NETBSAD skipped: only %.2f%% of periods are non-zero", 100 * share)
+    return out
+
+
+#: Weather: Open-Meteo Previous-Runs ``_previous_day<K>`` is the run issued about K*24 h before the
+#: valid time. Assuming ~8 h from run start to availability, day K is usable at lead h iff
+#: ``24*K - 8 >= h``  ->  K=1 for h<=16, K=2 for 16<h<=40.  (Assumption; see methodology.)
+WX_AVAIL_H: float = 8.0
+_WX_RE = re.compile(r"^(?P<var>.+?)_previous_day(?P<k>\d)(?:_(?P<model>.+))?$")
+
+
+def wx_day_for_lead(lead_h: float, avail_h: float = WX_AVAIL_H) -> int:
+    """Smallest previous-day offset K whose run is available at ``lead_h`` (leak rule)."""
+    return int(np.ceil((lead_h + avail_h) / 24.0))
+
+
+def _wx_national(root: Path) -> dict[tuple[str, int], pd.DataFrame] | None:
+    """Return ``{(var, K): DataFrame[time, mean, pt_std, mod_std]}`` on a half-hourly UTC grid."""
+    path = root / "processed/openmeteo/weather_previous_runs.parquet"
+    if not path.exists():
+        return None
+    w = pd.read_parquet(path)
+    w["time"] = pd.to_datetime(w["time"], utc=True).astype(_NS)
+    out: dict[tuple[str, int], pd.DataFrame] = {}
+    groups: dict[tuple[str, int], list[str]] = {}
+    for c in w.columns:
+        m = _WX_RE.match(c)
+        if m:
+            groups.setdefault((m["var"], int(m["k"])), []).append(c)
+    for (var, k), cols in groups.items():
+        d = w[["point", "time", *cols]].copy()
+        if var == "wind_speed_100m":  # capped cubic power-curve proxy, per point and model
+            pw = (d[cols].clip(upper=13.0) / 13.0) ** 3
+            pw.columns = [f"{c}__pw" for c in cols]
+            d = pd.concat([d, pw], axis=1)
+        pm = d.groupby("time")
+        # mean over points of the per-point model mean; spreads across points and across models
+        ref = [c for c in cols if "ecmwf" in c and d[c].notna().any()] or cols
+        d["_pm"] = d[ref].mean(axis=1)  # one reference model -> comparable across K
+        agg = pm["_pm"].agg(["mean", "std"]).rename(columns={"std": "pt_std"})
+        agg["mod_std"] = d.assign(_s=d[cols].std(axis=1)).groupby("time")["_s"].mean()
+        if var == "wind_speed_100m":
+            agg["pow"] = (
+                d.assign(_p=d[[c for c in d.columns if c.endswith("__pw")]].mean(axis=1))
+                .groupby("time")["_p"]
+                .mean()
+            )
+        agg = agg.astype(float).sort_index()
+        # hourly -> half-hourly by linear interpolation within the same run
+        half = agg.reindex(agg.index.union(agg.index + pd.Timedelta(minutes=30))).interpolate(
+            limit=1
+        )
+        out[(var, k)] = half.reset_index().rename(columns={"index": "time"})
+    return out
+
+
+def _weather_features(left: pd.DataFrame, root: Path) -> pd.DataFrame | None:
+    """Point-in-time NWP features for each (target, lead) row (``wx_*`` columns)."""
+    nat = _wx_national(root)
+    if nat is None:
+        log.warning("no weather file; skipping wx_ features")
+        return None
+    kmax = max(k for _, k in nat)
+    k_row = np.ceil((left["lead_h"].to_numpy() + WX_AVAIL_H) / 24.0).astype(int)
+    k_row = np.minimum(np.maximum(k_row, 1), kmax)
+    res = pd.DataFrame(index=left.index)
+    cols_out = {
+        "wind_speed_100m": ["mean", "pt_std", "mod_std", "pow"],
+        "temperature_2m": ["mean"],
+        "shortwave_radiation": ["mean", "pt_std"],
+    }
+    tgt = left["startTime"]
+    for var, stats in cols_out.items():
+        for stat in stats:
+            name = f"wx_{var.split('_')[0] if var != 'wind_gusts_10m' else 'gust'}_{stat}"
+            name = {
+                "wx_wind_mean": "wx_wspd",
+                "wx_wind_pt_std": "wx_wspd_ptsd",
+                "wx_wind_mod_std": "wx_wspd_modsd",
+                "wx_wind_pow": "wx_wpow",
+                "wx_temperature_mean": "wx_temp",
+                "wx_shortwave_mean": "wx_ghi",
+                "wx_shortwave_pt_std": "wx_ghi_ptsd",
+                "wx_cloud_mean": "wx_cloud",
+            }.get(name, name)
+            vals = np.full(len(left), np.nan)
+            for k in range(1, kmax + 1):
+                if (var, k) not in nat or stat not in nat[(var, k)]:
+                    continue
+                sel = np.flatnonzero(k_row == k)
+                if sel.size == 0:
+                    continue
+                src = nat[(var, k)].set_index("time")[stat]
+                vals[sel] = src.reindex(tgt.iloc[sel]).to_numpy()
+            res[name] = vals
+    # run-to-run revision of the wind proxy where both runs are available (short leads)
+    if ("wind_speed_100m", 1) in nat and ("wind_speed_100m", 2) in nat:
+        a = nat[("wind_speed_100m", 1)].set_index("time")["pow"].reindex(tgt).to_numpy()
+        b = nat[("wind_speed_100m", 2)].set_index("time")["pow"].reindex(tgt).to_numpy()
+        res["wx_wpow_rev"] = np.where(k_row == 1, a - b, np.nan)
+    return res
+
+
 def build_dataset(
     root: str | Path,
     leads: tuple[float, ...] = LEADS_H,
@@ -256,7 +418,13 @@ def build_dataset(
     root = Path(root)
     sp = pd.read_parquet(
         root / "processed/elexon/system_prices.parquet",
-        columns=["startTime", "netImbalanceVolume", "systemSellPrice"],
+        columns=[
+            "startTime",
+            "settlementDate",
+            "settlementPeriod",
+            "netImbalanceVolume",
+            "systemSellPrice",
+        ],
     )
     sp["startTime"] = sp["startTime"].astype(_NS)
     sp = sp.drop_duplicates("startTime").sort_values("startTime")
@@ -427,6 +595,23 @@ def build_dataset(
             seasonal=(),
         )[["mid_last"]]
     )
+
+    for name, series in _bsad_series(root, sp).items():
+        lf = lagged_features(
+            left["startTime"],
+            left["issue"],
+            series,
+            name,
+            lag_h=niv_lag_h,
+            windows=(48,),
+            seasonal=(),
+        )
+        keep = [f"{name}_last", f"{name}_m48"] + ([f"{name}_s48"] if name == "dis_vol" else [])
+        feats.append(lf[keep])
+
+    wx = _weather_features(left, root)
+    if wx is not None:
+        feats.append(wx)
 
     out = pd.concat(
         [left.drop(columns=["hourStart"]), cal.drop(columns=["local_date"]), *feats], axis=1
